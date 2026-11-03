@@ -11,9 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for Reflection Beam: registration, the pure PyTorch ops and the
-fp32-accurate router, on CPU and on TPU.
+"""Unit tests for Reflection Beam: registration, config checks, the pure PyTorch
+ops and the fp32-accurate router, on CPU and on TPU.
 """
+
+import functools
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -22,9 +25,12 @@ from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import GateLinear
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models import ModelRegistry
+from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+from vllm.transformers_utils.configs.beam import BeamConfig
 
 from vllm_torchtpu.models.vllm import register_models
 from vllm_torchtpu.models.vllm.beam import ops
+from vllm_torchtpu.models.vllm.beam.config import TPUBeamConfig
 from vllm_torchtpu.models.vllm.beam.model import BeamForCausalLM
 from vllm_torchtpu.models.vllm.beam.router import BeamRouter
 
@@ -39,6 +45,102 @@ def test_beam_resolves_to_this_package():
     register_models()
     model_cls = ModelRegistry.models["BeamForCausalLM"].load_model_cls()
     assert model_cls is BeamForCausalLM
+    assert MODELS_CONFIG_MAP["BeamForCausalLM"] is TPUBeamConfig
+
+
+# The fields of the released Beam-1.0-501B-A23B config.json.
+RELEASED_CONFIG = dict(
+    vocab_size=151936,
+    hidden_size=5120,
+    intermediate_size=20480,
+    num_hidden_layers=52,
+    num_attention_heads=48,
+    num_key_value_heads=8,
+    head_dim=128,
+    hidden_act="silu",
+    max_position_embeddings=1048576,
+    rms_norm_eps=1e-06,
+    tie_word_embeddings=False,
+    rope_parameters={
+        "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0},
+        "full_attention": None,
+    },
+    sliding_window=512,
+    layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 8
+    + ["sliding_attention"] * 3
+    + ["full_attention"],
+    mlp_layer_types=["dense"] * 3 + ["sparse"] * 49,
+    moe_intermediate_size=2560,
+    num_experts_per_tok=8,
+    num_experts=256,
+    norm_topk_prob=True,
+    n_group=8,
+    topk_group=4,
+    routed_scaling_factor=2.5,
+    final_logit_softcapping=30.0,
+)
+
+
+def _config_for_checks():
+    """A VllmConfig stand-in with the released Beam config and no extra features."""
+    return SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=BeamConfig(**RELEASED_CONFIG), dtype=BF16
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            prefill_context_parallel_size=1,
+            decode_context_parallel_size=1,
+            enable_eplb=False,
+        ),
+        speculative_config=None,
+        lora_config=None,
+    )
+
+
+def _unset_check_flags(monkeypatch):
+    for name in ("TPU_MOE_SEQUENCE_PARALLEL", "VLLM_TPU_BLOCK_MAJOR_KV"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_config_accepts_released_model(monkeypatch):
+    _unset_check_flags(monkeypatch)
+    TPUBeamConfig.verify_and_update_config(_config_for_checks())
+
+
+# (attribute path or env.<flag>, value, error) for each config check.
+REJECTED = [
+    # BeamRouter's split weight is exact only for bf16 activations.
+    ("model_config.dtype", torch.float16, "--dtype bfloat16"),
+    ("speculative_config", object(), "--speculative-config"),
+    ("parallel_config.pipeline_parallel_size", 2, "--pipeline-parallel-size 1"),
+    ("parallel_config.prefill_context_parallel_size", 2, "context parallelism"),
+    ("parallel_config.decode_context_parallel_size", 2, "context parallelism"),
+    ("env.TPU_MOE_SEQUENCE_PARALLEL", "1", "unset TPU_MOE_SEQUENCE_PARALLEL"),
+    ("parallel_config.enable_eplb", True, "--enable-eplb"),
+    ("lora_config", object(), "--enable-lora"),
+    ("model_config.hf_config.tie_word_embeddings", True, "tie_word_embeddings=False"),
+    # Divides the 48 Q heads but not the 8 KV heads.
+    ("parallel_config.tensor_parallel_size", 3, r"use one of \[1, 2, 4, 8\], got 3"),
+    ("env.VLLM_TPU_BLOCK_MAJOR_KV", "1", "unset VLLM_TPU_BLOCK_MAJOR_KV"),
+]
+
+
+@pytest.mark.parametrize(
+    "path,value,match", REJECTED, ids=[p.rsplit(".", 1)[-1] for p, _, _ in REJECTED]
+)
+def test_config_rejects_unsupported(monkeypatch, path, value, match):
+    """Rejected when the config is built, before any worker starts."""
+    _unset_check_flags(monkeypatch)
+    config = _config_for_checks()
+    *parents, name = path.split(".")
+    if parents == ["env"]:
+        monkeypatch.setenv(name, value)
+    else:
+        setattr(functools.reduce(getattr, parents, config), name, value)
+    with pytest.raises(NotImplementedError, match=match):
+        TPUBeamConfig.verify_and_update_config(config)
 
 
 def _tuple(x):
