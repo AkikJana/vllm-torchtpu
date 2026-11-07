@@ -293,9 +293,10 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         ),
         compute_logits_from_hidden_states=lambda _hs: torch.zeros(1, 8),
         _attn_metadata_builder_ctx=SimpleNamespace(
-            mamba_state_indices=None, unified_mamba_state_indices=None
+            mamba_state_indices=None, unified_mamba_state_indices=None, seq_lens=None
         ),
         mamba_slot_read_offsets=None,
+        _plan_spec_boundary_copies=lambda *_args: None,
         speculative_config=None,
         _fence_spec_kv_under_token_copy=False,
         _is_dspark_pd_producer=False,
@@ -303,6 +304,7 @@ def test_runner_execute_model_and_sample_tokens_forward_step_nan_check(
         _get_sampling_generator=lambda: None,
         _greedy_sample=lambda _logits: torch.tensor([7]),
         _update_mamba_slot_read_offsets=lambda *_args: None,
+        _copy_spec_boundary_states=lambda *_args: None,
         _update_num_xla_graphs=lambda *_args: None,
     )
     runner._stage_timing.stage.return_value = contextlib.nullcontext()
