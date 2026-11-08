@@ -134,6 +134,7 @@ _SUBMODULES = frozenset(
         "specs",
         "verdict",
         "vmem",
+        "workbench",
         "workbench_engine",
     }
 )
