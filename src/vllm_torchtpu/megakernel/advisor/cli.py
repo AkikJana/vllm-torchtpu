@@ -34,9 +34,11 @@ from .regimes import (
     recommend_parallelism,
 )
 from .report import (
+    build_bucket_schedule,
     format_advisor_summary,
     format_regime_table,
     write_advisor_html,
+    write_bucket_schedule,
 )
 from .specs import (
     DispatchRegime,
@@ -303,6 +305,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="deployment_preset",
         help="Ignore deployment presets during regime sweep.",
     )
+    parser.add_argument(
+        "--bucket-schedule",
+        type=str,
+        default=None,
+        help=(
+            "Write advisory advisor.bucket_schedule.v1 JSON schedule to this path "
+            "(or '-' for stdout)"
+        ),
+    )
     return parser
 
 
@@ -431,7 +442,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise errors.MegakernelConfigError(msg)
         measurements_val = str(bundled_path)
 
-    if args.regime_sweep or args.html:
+    if args.regime_sweep or args.html or args.bucket_schedule:
         sweep = advise_regimes(
             profile,
             chip_spec,
@@ -453,6 +464,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if args.html:
             write_advisor_html(sweep, args.html)
+        if args.bucket_schedule is not None:
+            if args.bucket_schedule == "-":
+                _emit_json(build_bucket_schedule(sweep).to_dict(), "-")
+            else:
+                write_bucket_schedule(sweep, args.bucket_schedule)
         if args.json is not None:
             _emit_json(sweep.to_dict(), args.json)
         elif args.regime_sweep:
