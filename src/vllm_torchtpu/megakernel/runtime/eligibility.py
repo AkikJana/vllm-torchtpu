@@ -23,6 +23,7 @@ here.
 from __future__ import annotations
 
 from collections.abc import Container, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 from ..errors import MegakernelConfigError
 from ..profiles.default import chip_budget
@@ -34,7 +35,6 @@ from .contract import (
     EligibilityResult,
     StepDecision,
 )
-from .policy import MTP_VERIFY_TOKENS, BucketPolicy
 from .stats import (
     BatchShape,
     MKABCalibrator,
@@ -43,6 +43,9 @@ from .stats import (
     check_query_start_loc_uniform,
     inspect_batch_shape,
 )
+
+if TYPE_CHECKING:
+    from .policy import BucketPolicy
 
 _STARTUP_FLAG_RULES = (
     ("unaligned_cache_layout", "requires unified KV and recurrent cache layout"),
@@ -175,8 +178,8 @@ def check_step_eligibility(
 ) -> StepDecision:
     """Decide whether a forward step with `batch_shape` can run on a bucket.
 
-    The bucket policy serves `T=1` decode and `T=MTP_VERIFY_TOKENS` verify
-    steps; any other uniform step size is `stock_q{T}`.
+    The bucket policy serves `T=1` decode and `T in bucket_policy.verify_tokens`
+    verify steps; any other uniform step size is `stock_q{T}`.
     """
     if not batch_shape.eligible or batch_shape.num_reqs <= 0:
         return StepDecision(
@@ -186,11 +189,12 @@ def check_step_eligibility(
             batch_shape.tokens_per_req,
         )
     num_reqs, T = batch_shape.num_reqs, batch_shape.tokens_per_req
-    if T not in (1, MTP_VERIFY_TOKENS):
+    verify_tokens = bucket_policy.verify_tokens
+    if T not in (1, *verify_tokens):
         return StepDecision(False, f"stock_q{T}", num_reqs, T)
     if not mrope_ok:
         return StepDecision(False, "stock_mrope", num_reqs, T)
-    is_verify = T == MTP_VERIFY_TOKENS
+    is_verify = T in verify_tokens
     b_list = bucket_policy.verify_buckets if is_verify else bucket_policy.buckets
     max_b = bucket_policy.max_verify_bucket if is_verify else bucket_policy.max_bucket
     active_rows = num_reqs * T

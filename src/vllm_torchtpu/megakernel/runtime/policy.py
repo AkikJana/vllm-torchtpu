@@ -79,11 +79,12 @@ def select_bucket(num_tokens: int, buckets: Sequence[int] = DEFAULT_BUCKETS) -> 
 
 @dataclass(frozen=True)
 class BucketPolicy:
-    """Resolved `T=1` decode and `T=4` verify buckets and output-padding rules."""
+    """Resolved `T=1` decode and multi-token verify buckets and output padding."""
 
     buckets: tuple[int, ...] = DEFAULT_BUCKETS
     verify_buckets: tuple[int, ...] = DEFAULT_VERIFY_BUCKETS
     token_paddings: tuple[int, ...] = ()
+    verify_tokens: tuple[int, ...] = (MTP_VERIFY_TOKENS,)
 
     @property
     def max_bucket(self) -> int:
@@ -104,31 +105,67 @@ class BucketPolicy:
         buckets_explicit: bool | None = None,
         verify_buckets_explicit: bool | None = None,
         token_paddings: Sequence[int] = (),
+        verify_tokens: Sequence[int] = (MTP_VERIFY_TOKENS,),
     ) -> BucketPolicy:
         """Resolve `(buckets, verify_buckets)` from explicit args or `profile`."""
-        def_b = DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
-        p_ver = profile.verify_buckets
-        def_v = DEFAULT_VERIFY_BUCKETS if p_ver is None else p_ver
-        eff_b = def_b if buckets is None else buckets
-        eff_v = def_v if verify_buckets is None else verify_buckets
-        b_sorted = tuple(sorted(int(x) for x in eff_b))
-        v_sorted = tuple(sorted(int(x) for x in eff_v))
+        default_buckets = (
+            DEFAULT_BUCKETS if profile.buckets is None else profile.buckets
+        )
+        profile_verify = profile.verify_buckets
+        verify_tokens_tuple = tuple(int(width) for width in verify_tokens)
+        _need(
+            all(width > 0 for width in verify_tokens_tuple),
+            f"invalid verify_tokens={verify_tokens_tuple}",
+        )
+        default_verify = (
+            DEFAULT_VERIFY_BUCKETS if profile_verify is None else profile_verify
+        )
+        effective_buckets = default_buckets if buckets is None else buckets
+        effective_verify = [
+            int(val)
+            for val in (default_verify if verify_buckets is None else verify_buckets)
+        ]
+        b_sorted = tuple(sorted(int(val) for val in effective_buckets))
+        v_sorted = tuple(
+            sorted(
+                val
+                for val in effective_verify
+                if not any(val % width for width in verify_tokens_tuple)
+            )
+        )
+        buckets_given = buckets is not None
+        verify_given = verify_buckets is not None
+        buckets_exp = buckets_given if buckets_explicit is None else buckets_explicit
+        verify_exp = (
+            verify_given if verify_buckets_explicit is None else verify_buckets_explicit
+        )
+        unaligned_verify = (
+            [val for val in effective_verify if val not in v_sorted]
+            if verify_exp
+            else []
+        )
+        _need(
+            not unaligned_verify,
+            f"verify_buckets {unaligned_verify} not divisible by "
+            f"verify_tokens={verify_tokens_tuple}",
+        )
         if speculative_tokens is not None:
-            b_ok = buckets is not None
-            v_ok = verify_buckets is not None
-            b_exp = b_ok if buckets_explicit is None else buckets_explicit
-            v_exp = v_ok if verify_buckets_explicit is None else verify_buckets_explicit
-            if speculative_tokens == MTP_SPECULATIVE_TOKENS and not b_exp:
+            if speculative_tokens + 1 in verify_tokens_tuple and not buckets_exp:
                 b_sorted = ()
-            elif speculative_tokens != MTP_SPECULATIVE_TOKENS and not v_exp:
+            elif speculative_tokens + 1 not in verify_tokens_tuple and not verify_exp:
                 v_sorted = ()
-        return cls(b_sorted, v_sorted, tuple(int(x) for x in token_paddings))
+        return cls(
+            b_sorted,
+            v_sorted,
+            tuple(int(val) for val in token_paddings),
+            verify_tokens_tuple,
+        )
 
     def select(
         self, active_rows: int, tokens_per_seq: int = 1, *, clamp: bool = False
     ) -> int:
         """Select the smallest bucket for `(tokens_per_seq, active_rows)`."""
-        is_v = tokens_per_seq == MTP_VERIFY_TOKENS
+        is_v = tokens_per_seq in self.verify_tokens
         b_list = self.verify_buckets if is_v else self.buckets
         max_b = self.max_verify_bucket if is_v else self.max_bucket
         target = max(tokens_per_seq, min(active_rows, max_b)) if clamp else active_rows
@@ -143,5 +180,6 @@ class BucketPolicy:
         """Yield `(tokens_per_seq, bucket_t)` across decode and verify buckets."""
         for b in self.buckets:
             yield (1, b)
-        for b in self.verify_buckets:
-            yield (MTP_VERIFY_TOKENS, b)
+        yield from (
+            (width, b) for width in self.verify_tokens for b in self.verify_buckets
+        )

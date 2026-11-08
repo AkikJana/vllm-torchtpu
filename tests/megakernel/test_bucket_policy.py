@@ -46,7 +46,7 @@ from vllm_torchtpu.megakernel.runtime.policy import (
     parse_mk_verify_buckets,
     select_bucket,
 )
-from vllm_torchtpu.megakernel.runtime.stats import BatchShape
+from vllm_torchtpu.megakernel.runtime.stats import BatchShape, inspect_batch_shape
 
 _SRC = Path(__file__).resolve().parents[2] / "src"
 
@@ -415,3 +415,85 @@ def test_startup_without_tp_size_skips_the_tp_and_mesh_checks() -> None:
     assert not res.eligible and res.code == MESH_SIZE_MISMATCH
     res = check_startup_eligibility(tp_size=4, supported_tp_sizes=(8,), **_STARTUP_OK)
     assert res.code == UNSUPPORTED_TP_SIZE
+
+
+def test_verify_tokens_eight_bucket_policy_and_eligibility() -> None:
+    """Verify generalized verify_tokens in BucketPolicy and eligibility."""
+    prof_8 = Profile(
+        name="test_8", numerics="exact", buckets=(2,), verify_buckets=(8, 16)
+    )
+    pol_8 = BucketPolicy.resolve(prof_8, verify_tokens=(8,))
+    assert pol_8.verify_tokens == (8,)
+    pol_spec7 = BucketPolicy.resolve(prof_8, speculative_tokens=7, verify_tokens=(8,))
+    assert (pol_spec7.buckets, pol_spec7.verify_buckets) == ((), (8, 16))
+
+    pol_4_8 = BucketPolicy.resolve(
+        Profile(
+            name="test_4_8",
+            numerics="exact",
+            buckets=(2,),
+            verify_buckets=(4, 8, 16),
+        ),
+        verify_tokens=(4, 8),
+    )
+    assert pol_4_8.verify_tokens == (4, 8)
+    assert list(pol_4_8.iter_buckets()) == [(1, 2), (4, 8), (4, 16), (8, 8), (8, 16)]
+    pol_def_8 = BucketPolicy.resolve(
+        Profile(name="test_def", numerics="exact"), verify_tokens=(8,)
+    )
+    assert pol_def_8.verify_buckets == (8, 16, 24, 32, 40, 48, 56, 64)
+    assert (pol_def_8.select(16, 8),) == (16,)
+
+    b_shape_8 = BatchShape(eligible=True, num_reqs=1, tokens_per_req=8, reason="ok")
+    dec_8 = check_step_eligibility(
+        b_shape_8,
+        pol_8,
+        compiled_buckets={(8, 8)},
+        bucket_out_rows={(8, 8): 8},
+        input_rows=8,
+    )
+    assert (dec_8.eligible, dec_8.tokens_per_seq, dec_8.bucket_t) == (True, 8, 8)
+
+    pol_def = BucketPolicy()
+    dec_def = check_step_eligibility(
+        b_shape_8,
+        pol_def,
+        compiled_buckets={(1, 8)},
+        bucket_out_rows={},
+        input_rows=8,
+    )
+    assert (dec_def.eligible, dec_def.reason) == (False, "stock_q8")
+
+
+def test_resolve_explicit_verify_buckets_validation() -> None:
+    """Verify explicit verify_buckets raise ValueError when unaligned."""
+    prof = Profile(name="test_exp", numerics="exact", buckets=(2,))
+    with pytest.raises(ValueError, match=r"verify_buckets \[4\] not divisible"):
+        BucketPolicy.resolve(prof, verify_buckets=(4, 8), verify_tokens=(8,))
+    with pytest.raises(ValueError, match="invalid verify_tokens"):
+        BucketPolicy.resolve(prof, verify_tokens=(0,))
+    pol_non_exp = BucketPolicy.resolve(
+        prof,
+        verify_buckets=(4, 8),
+        verify_buckets_explicit=False,
+        verify_tokens=(8,),
+    )
+    assert pol_non_exp.verify_buckets == (8,)
+
+
+def test_verify_tokens_eight_from_query_start_loc() -> None:
+    """Verify batch inspection and step eligibility for 8-token verify steps."""
+    batch_shape = inspect_batch_shape(
+        num_reqs=4,
+        has_slot_read_offsets=True,
+        query_start_loc=[0, 8, 16, 24, 32],
+    )
+    pol = BucketPolicy(verify_tokens=(4, 8))
+    dec = check_step_eligibility(
+        batch_shape,
+        pol,
+        compiled_buckets={(8, 32)},
+        bucket_out_rows={(8, 32): 32},
+        input_rows=32,
+    )
+    assert (dec.eligible, dec.tokens_per_seq, dec.bucket_t) == (True, 8, 32)
