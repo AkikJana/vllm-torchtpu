@@ -19,6 +19,9 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..advisor.calibrate import (
+        calibrate_trace,
+    )
     from ..advisor.chips import (
         BUILTIN_CHIP_SPECS,
         REQUIRED_CHIP_SPEC_KEYS,
@@ -114,6 +117,7 @@ if TYPE_CHECKING:
 _SUBMODULES = frozenset(
     {
         "assets",
+        "calibrate",
         "chips",
         "cli",
         "jax_bridge",
@@ -129,6 +133,8 @@ _SUBMODULES = frozenset(
 )
 
 _LAZY = {
+    # calibrate
+    "calibrate_trace": ".calibrate",
     # chips
     "BUILTIN_CHIP_SPECS": ".chips",
     "ChipSpec": ".chips",
@@ -278,6 +284,7 @@ __all__ = [
     "advise_from_spec",
     "advise_regimes",
     "build_arg_parser",
+    "calibrate_trace",
     "compare_parallelism_candidates",
     "compute_all_reduce_transfer_cost",
     "compute_per_token_vmem_bytes",
