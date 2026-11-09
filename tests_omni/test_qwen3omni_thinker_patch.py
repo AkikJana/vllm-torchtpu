@@ -15,20 +15,27 @@
 
 The on-TPU behaviour of the patched encoder (exact window multiples, token
 counts, CPU parity) is covered by test_qwen3_omni_audio_encoder_tpu.py; these
-tests check the callback contract the patch registry relies on and the two
-device moves the patch performs, on CPU with the encoder's methods stubbed.
+tests check the callback contract the patch registry relies on and the
+static-shape bucketing wrapper on CPU.
 """
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from vllm_omni.model_executor.models.qwen3_omni import (
+    qwen3_omni_moe_thinker as thinker_mod,
+)
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 
 from vllm_torchtpu.omni.patches.qwen3omni_thinker import (
     _AUDIO_CHUNK_LENGTHS_PATCHED,
+    _select_bucket,
     maybe_patch_qwen3_omni_thinker,
 )
 
@@ -41,6 +48,61 @@ def _model_config(*architectures: str) -> SimpleNamespace:
 
 
 OMNI_THINKER = _model_config("Qwen3OmniMoeForConditionalGeneration")
+
+
+def _isolate_thinker_patch_targets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restore every attribute rebound by maybe_patch_qwen3_omni_thinker."""
+    monkeypatch.setattr(
+        thinker_mod.Qwen3OmniMoeAudioEncoder,
+        "forward",
+        thinker_mod.Qwen3OmniMoeAudioEncoder.forward,
+    )
+    monkeypatch.setattr(
+        thinker_mod.Qwen3OmniMoeAudioEncoder,
+        "_tpu_orig_forward",
+        getattr(thinker_mod.Qwen3OmniMoeAudioEncoder, "_tpu_orig_forward", None),
+        raising=False,
+    )
+
+
+class _DummyLinear(nn.Module):
+    def forward(self, x):
+        return x, None
+
+
+class _DummyEncoderLayer(nn.Module):
+    def __init__(self, seen_seq_lens: list[int] | None = None):
+        super().__init__()
+        self.seen_seq_lens = seen_seq_lens
+
+    def forward(self, hs, cu_seqlens, max_seqlen=None):
+        assert cu_seqlens.shape == (128,)
+        assert max_seqlen is None
+        if self.seen_seq_lens is not None:
+            self.seen_seq_lens.append(int(hs.shape[0]))
+        return hs
+
+
+class _DummyAudioEncoder(nn.Module):
+    num_mel_bins = 16
+    n_window = 50
+    n_window_infer = 400
+    conv_chunksize = 16
+
+    def __init__(self, seen_seq_lens: list[int] | None = None):
+        super().__init__()
+        self.conv2d1 = nn.Conv2d(1, 4, kernel_size=3, stride=2, padding=1)
+        self.conv2d2 = nn.Conv2d(4, 4, kernel_size=3, stride=2, padding=1)
+        self.conv2d3 = nn.Conv2d(4, 4, kernel_size=3, stride=2, padding=1)
+        self.conv_out = _DummyLinear()
+        self.positional_embedding = SimpleNamespace(
+            positional_embedding=torch.zeros(64, 8)
+        )
+        self.layers = nn.ModuleList([_DummyEncoderLayer(seen_seq_lens)])
+        self.ln_post = nn.Identity()
+        self.proj1 = _DummyLinear()
+        self.act = F.gelu
+        self.proj2 = _DummyLinear()
 
 
 def test_non_omni_config_is_not_consumed():
@@ -60,23 +122,18 @@ def test_non_omni_config_is_not_consumed():
 
 
 def test_qwen3_omni_audio_chunk_lengths_patch(monkeypatch):
-    seen = {}
+    _isolate_thinker_patch_targets(monkeypatch)
 
-    def _forward(self, input_features, feature_lens, aftercnn_lens):
-        seen["feature_lens_device"] = feature_lens.device.type
-        return input_features, feature_lens, aftercnn_lens
+    def _orig_forward(self, input_features, feature_lens, aftercnn_lens):
+        return input_features
 
-    # Upstream forward runs the whole encoder. Both class attributes the patch
-    # rebinds are restored after the test.
-    monkeypatch.setattr(Qwen3OmniMoeAudioEncoder, "forward", _forward)
-    monkeypatch.setattr(
-        Qwen3OmniMoeAudioEncoder, "_get_cnn_output_lengths", lambda self, x: x
-    )
+    monkeypatch.setattr(Qwen3OmniMoeAudioEncoder, "forward", _orig_forward)
 
     assert maybe_patch_qwen3_omni_thinker(OMNI_THINKER) is True
     patched = Qwen3OmniMoeAudioEncoder.forward
-    assert patched is not _forward
+    assert patched is not _orig_forward
     assert getattr(patched, _AUDIO_CHUNK_LENGTHS_PATCHED, False)
+    assert Qwen3OmniMoeAudioEncoder._tpu_orig_forward is _orig_forward
 
     class TrackedTensor(torch.Tensor):
         cpu_called: bool = False
@@ -85,18 +142,45 @@ def test_qwen3_omni_audio_chunk_lengths_patch(monkeypatch):
             self.cpu_called = True
             return super().cpu(*args, **kwargs)
 
-    enc = SimpleNamespace(conv2d1=SimpleNamespace(weight=torch.empty(0)))
-    lens = torch.tensor([800]).as_subclass(TrackedTensor)
-    _, out_lens, _ = patched(enc, torch.randn(128, 800), lens, torch.tensor([104]))
-    # chunk_num's ceil(feature_lens / window) runs on CPU, where it is exact.
-    assert lens.cpu_called is True
-    assert seen["feature_lens_device"] == "cpu"
-    assert out_lens.device.type == "cpu"
-    # ... and the CNN lengths come back on the encoder's device.
-    out = Qwen3OmniMoeAudioEncoder._get_cnn_output_lengths(enc, torch.tensor([100]))
-    assert out.device == enc.conv2d1.weight.device
-    assert torch.equal(out, torch.tensor([100]))
+    enc = _DummyAudioEncoder()
+    feat_lens = torch.tensor([800]).as_subclass(TrackedTensor)
+    cnn_lens = torch.tensor([104]).as_subclass(TrackedTensor)
+    out = patched(enc, torch.zeros(16, 800), feat_lens, cnn_lens)
+    assert feat_lens.cpu_called is True
+    assert cnn_lens.cpu_called is True
+    assert out.shape == (104, 8)
 
-    # Idempotent: a second application keeps the same wrapper.
+    # Idempotent: a second application keeps the same wrapper and orig_forward.
     assert maybe_patch_qwen3_omni_thinker(OMNI_THINKER) is True
     assert Qwen3OmniMoeAudioEncoder.forward is patched
+    assert Qwen3OmniMoeAudioEncoder._tpu_orig_forward is _orig_forward
+
+
+def test_qwen3_omni_audio_encoder_static_bucketing(monkeypatch):
+    _isolate_thinker_patch_targets(monkeypatch)
+    seen_layer_seq_lens: list[int] = []
+
+    class DummyAudioEncoder(_DummyAudioEncoder):
+        def __init__(self):
+            super().__init__(seen_layer_seq_lens)
+
+    monkeypatch.setattr(thinker_mod, "Qwen3OmniMoeAudioEncoder", DummyAudioEncoder)
+
+    assert maybe_patch_qwen3_omni_thinker(OMNI_THINKER) is True
+
+    with patch.object(
+        nn.Module,
+        "cpu",
+        side_effect=AssertionError("Unexpected Module.cpu() host mutation"),
+    ):
+        enc = DummyAudioEncoder()
+        for flen, alen in ((220, 29), (310, 41), (670, 87), (800, 104)):
+            out = enc(
+                torch.zeros(16, flen),
+                torch.tensor([flen], dtype=torch.long),
+                torch.tensor([alen], dtype=torch.long),
+            )
+            assert out.shape == (alen, 8)
+        assert seen_layer_seq_lens == [512, 512, 512, 512]
+        assert _select_bucket(5, (8, 16), align=8) == 8
+        assert _select_bucket(19, (8, 16), align=8) == 24
