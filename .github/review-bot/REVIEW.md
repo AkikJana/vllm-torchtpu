@@ -86,7 +86,7 @@ Order findings blocking first, then should-fix, most severe first within each. B
 
 ## 4. Area rules
 
-### Kernels: `src/vllm_torchtpu/{kernels,megakernel}/**`
+### Kernels: `src/vllm_torchtpu/{kernels,megakernel/core}/**`
 
 - [B] **DMA bounds**. With `disable_bounds_checks=True`, every DMA stays inside live data: none for empty inputs or padded rows, sources clamped to the last live page, ring offsets wrapped, VMEM destinations in range at the largest loop index. The loop provably runs as many steps as the DMA prologue starts, and admission proves every whole DMA tile fits.
 - [B] **TPU test per path** (R-8.1, R-8.4). Each new Pallas kernel, argument, mode, or dtype path needs a `tpu_test` running the real kernel against an independent NumPy or JAX reference; plain JAX helpers can test on CPU (R-8.5). Patched-out kernels and Python stand-ins for a Pallas `Ref` do not count. An untested kernel is blocking; a missing case for a new argument is should-fix.
@@ -97,7 +97,7 @@ Order findings blocking first, then should-fix, most severe first within each. B
 - [S] **Time tuned values** (P-15, P-16). Changes to block sizes, tiles, VMEM fractions, or admitted shapes need on-hardware timing on the current head per affected generation, including untargeted paths; only measured generations count as calibrated. Skip this when speed cannot change.
 - [S] **DMA scheduling** (P-7, P-11). Wait on a DMA just before first use, and start independent copies first. Hoist loop-invariant weight or scale loads and casts, unless keeping them live spills vector registers; do not flag repeated pure math in a Python-unrolled loop, which the compiler usually merges. Avoid many tiny serial grid steps.
 
-### Layers and quantization: `src/vllm_torchtpu/{layers,lora,models}/**`
+### Layers and quantization: `src/vllm_torchtpu/{layers,lora,models,megakernel/adapter}/**`
 
 - [B] **One MoE decision**. Every site that picks a layer's MoE path, or who runs its DP/PCP collectives, gives the same answer. Per-layer arming comes from what `prebuild_fused_moe_ep` stored on the layer's quant method (`fused_moe_ep_supported(qm)`), never the env flag; process-wide choices come from one shared predicate. Admission finishes before any requant or weight install. Test rank-summing ops at PCP > 1.
 - [B] **Shared MoE entry points** (Q-1). Route through `moe_routing.route()` and resolve activations through `TpuMoEActivationMixin`. A fused kernel that routes inside refuses routing it cannot reproduce (a custom routing function, another scoring function, grouped top-k).
