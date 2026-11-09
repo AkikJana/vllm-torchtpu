@@ -44,8 +44,12 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-_STOCK_PLACEHOLDER_LINE = """      output_shapes = [
-          torch_placeholder(aval, mesh=self.mesh) for aval in lowered.out_avals
+_STOCK_PLACEHOLDER_LINE = """      specs = _normalize_output_partition_specs(
+          self.output_partition_specs, len(lowered.out_avals)
+      ) or [None] * len(lowered.out_avals)
+      output_shapes = [
+          torch_placeholder(aval, mesh=self.mesh, partition_spec=spec)
+          for aval, spec in zip(lowered.out_avals, specs)
       ]"""
 _SHARDED_PLACEHOLDER_LINE = (
     """      output_shapes = _sharded_output_placeholders(lowered, self.mesh)"""
@@ -204,11 +208,10 @@ def sharded_jax_op(
     op = torch.library.custom_op(name, wrapped_fn, mutates_args=())
 
     def fake_fn(*args, **kwargs):
-        jax_args = pallas_impl.jax_placeholders(
-            args, mesh=mesh, partition_specs=input_partition_specs
-        )
+        norm_args, norm_kwargs = wrapped_fn._normalize_invocation_args(args, kwargs)
+        jax_args, jax_kwargs = wrapped_fn._get_jax_placeholders(norm_args, norm_kwargs)
         with jax._src.config.export_ignore_forward_compatibility(True):
-            lowered = wrapped_fn.exported(*jax_args, **kwargs)
+            lowered = wrapped_fn.exported(*jax_args, **jax_kwargs)
         return lowered.out_tree.unflatten(_sharded_output_placeholders(lowered, mesh))
 
     op.register_fake(fake_fn)
