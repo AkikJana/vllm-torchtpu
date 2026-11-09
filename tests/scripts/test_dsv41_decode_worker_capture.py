@@ -128,6 +128,7 @@ def test_dp16_ci_requires_push_and_dynamic_eplb_without_split_topology(
             MOE_FUSED_EP_PUSH_SC_PREPUSH=prepush,
             MOE_FUSED_EP_PUSH_TC_EXCHANGE=exchange,
             TPU_MOE_EPLB_DYNAMIC=eplb,
+            TPU_MOE_EPLB_MODE="decode_only",
         ),
     )
     # Push works without #2646: no topology preprocessing is required.
